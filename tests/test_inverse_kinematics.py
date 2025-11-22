@@ -36,6 +36,12 @@ def create_test_chain(robot="kuka_iiwa", device="cpu"):
         full_urdf = urdf
         chain = pk.build_serial_chain_from_urdf(open(full_urdf, "rb").read(), "ee_gripper_link")
         chain = chain.to(device=device)
+    elif robot == "panda":
+        urdf = "franka_panda.urdf"
+        search_path = pybullet_data.getDataPath()
+        full_urdf = os.path.join(search_path, urdf)
+        chain = pk.build_serial_chain_from_urdf(open(full_urdf).read(), "panda_hand")
+        chain = chain.to(device=device)
     else:
         raise NotImplementedError(f"Robot {robot} not implemented")
     return chain, urdf

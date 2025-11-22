@@ -405,9 +405,619 @@ class PseudoInverseIK(InverseKinematics):
             ax[1].set_ylabel("rotation error")
             plt.show()
 
-        if i == self.max_iterations - 1:
-            sol.update(q, self.err_all, use_keep_mask=False)
-        return sol
+
+class DifferentiableIK(InverseKinematics):
+    """
+    Differentiable inverse kinematics solver using unrolled gradient-based optimization.
+
+    This solver performs a fixed number of gradient descent steps on the joint
+    angles q to minimize the pose error to the target pose. Each update is
+    constructed with create_graph=True so the final joint angles remain
+    differentiable with respect to the target pose (and any inputs used to
+    compute the loss).
+    """
+
+    def __init__(self, serial_chain: SerialChain, iters: int = 50, lr: float = 1e-2,
+                 orientation_weight: float = 1.0, pos_tolerance: float = 1e-4,
+                 rot_tolerance: float = 1e-3, device="cpu", dtype=torch.float32):
+        # We still call the base constructor with minimal required args
+        # Provide a dummy initial_config and num_retries to satisfy the base class
+        dummy_init = torch.zeros((1, len(serial_chain.get_joint_parameter_names())), dtype=dtype, device=device)
+        super().__init__(serial_chain, pos_tolerance=pos_tolerance, rot_tolerance=rot_tolerance,
+                         retry_configs=dummy_init, num_retries=1, joint_limits=None,
+                         max_iterations=iters, lr=lr)
+        self.iters = iters
+        self.orientation_weight = orientation_weight
+
+    def solve_unrolled(self, target_poses: Transform3d, init_q: Optional[torch.Tensor] = None,
+                       lr: Optional[float] = None):
+        """
+        Solve IK differentiably by unrolling gradient descent.
+
+        Args:
+            target_poses: Transform3d object of shape (N, 4, 4) representing goal poses.
+            init_q: Optional initial joint angles tensor of shape (N, DOF). If None,
+                    initializes to mid-point of joint limits if available, else zeros.
+            lr: learning rate for the unrolled gradient descent (overrides constructor lr)
+
+        Returns:
+            q: tensor of shape (N, DOF) containing the solved joint angles. The returned
+               tensor maintains a computational graph connecting it to `target_poses`.
+        """
+        if lr is None:
+            lr = self.lr
+
+        target = target_poses.get_matrix()
+        N = target.shape[0]
+        target_pos = target[:, :3, 3]
+        target_wxyz = rotation_conversions.matrix_to_quaternion(target[:, :3, :3])
+
+        dof = self.dof
+        device = self.device
+        dtype = self.dtype
+
+        if init_q is None:
+            # try mid joint limits, fall back to zeros
+            try:
+                low, high = self.chain.get_joint_limits()
+                low = torch.tensor(low, device=device, dtype=dtype)
+                high = torch.tensor(high, device=device, dtype=dtype)
+                init_q = ((low + high) / 2.0).unsqueeze(0).repeat(N, 1)
+            except Exception:
+                init_q = torch.zeros((N, dof), device=device, dtype=dtype)
+        else:
+            init_q = init_q.to(device=device, dtype=dtype)
+
+        q = init_q.clone().requires_grad_(True)
+
+        for i in range(self.iters):
+            # compute forward kinematics for current q
+            pose_tf = self.chain.forward_kinematics(q)  # Transform3d for end effector
+            m = pose_tf.get_matrix()  # (N, 4, 4)
+            # delta_pose expects shape (N, M, 4, 4); we use M=1
+            m_exp = m.unsqueeze(1)
+            dx, pos_diff, rot_diff = delta_pose(m_exp, target_pos, target_wxyz)
+            # dx has shape (N*1, 6, 1) -> reshape
+            dx = dx.squeeze(2).view(N, 6)
+            pos_err = dx[:, :3].norm(dim=-1)
+            rot_err = dx[:, 3:].norm(dim=-1)
+            loss = pos_err.mean() + self.orientation_weight * rot_err.mean()
+
+            # compute gradient of loss w.r.t q and take a differentiable gradient step
+            grads = torch.autograd.grad(loss, q, create_graph=True)[0]
+            q = q - lr * grads
+
+        return q
+
+
+def ee_pose_to_joint_positions(serial_chain: SerialChain,
+                                ee_pos: torch.Tensor,
+                                ee_rot: Optional[torch.Tensor] = None,
+                                rot_type: str = "quat",
+                                iters: int = 50,
+                                lr: float = 1e-2,
+                                orientation_weight: float = 1.0,
+                                init_q: Optional[torch.Tensor] = None,
+                                device: Optional[str] = None,
+                                dtype: Optional[torch.dtype] = None):
+    """
+    Given an end-effector pose (position + orientation), solve IK differentiably and
+    return the joint positions for each serial frame expressed in the end-effector frame
+    (i.e. with the end-effector at the origin). This function is fully differentiable
+    (assuming inputs are tensors with requires_grad as needed) because it uses
+    DifferentiableIK which unrolls gradient steps.
+
+    Args:
+        serial_chain: SerialChain model for the robot (e.g., Panda).
+        ee_pos: (..., 3) tensor of end-effector positions in meters.
+        ee_rot: optional orientation. Interpretation depends on `rot_type`:
+            - 'quat': quaternion [w,x,y,z] (...,4)
+            - 'matrix': rotation matrix (...,3,3)
+            - 'euler': Euler angles (...,3) using default convention
+        rot_type: one of {'quat','matrix','euler'}; when ee_rot is None identity rotation is used.
+        iters, lr, orientation_weight: DifferentiableIK solver hyperparameters.
+        init_q: optional initial joint angles (..., DOF)
+        device, dtype: override device/dtype; defaults to serial_chain.device/dtype
+
+    Returns:
+        joint_positions_in_eef: (N, K, 3) tensor of XYZ positions (meters) for each serial frame
+                                expressed in the end-effector frame (end effector at origin).
+        joint_angles: (N, DOF) tensor of joint angles (radians).
+
+    Notes:
+        - Units: positions are in meters (URDF convention) and angles in radians.
+        - The function broadcasts single-input tensors to batch size N=1.
+    """
+    if device is None:
+        device = serial_chain.device
+    if dtype is None:
+        dtype = serial_chain.dtype
+
+    # ensure tensors and batch dims
+    if not torch.is_tensor(ee_pos):
+        ee_pos = torch.tensor(ee_pos, dtype=dtype, device=device)
+    else:
+        ee_pos = ee_pos.to(device=device, dtype=dtype)
+
+    if ee_pos.dim() == 1:
+        ee_pos = ee_pos.unsqueeze(0)
+
+    if ee_rot is None:
+        ee_rot_t = None
+    else:
+        if not torch.is_tensor(ee_rot):
+            ee_rot_t = torch.tensor(ee_rot, dtype=dtype, device=device)
+        else:
+            ee_rot_t = ee_rot.to(device=device, dtype=dtype)
+        if ee_rot_t.dim() == 1:
+            ee_rot_t = ee_rot_t.unsqueeze(0)
+
+    # Build Transform3d from provided pos/rot
+    if ee_rot_t is None:
+        target_tf = Transform3d(pos=ee_pos, device=device, dtype=dtype)
+    else:
+        if rot_type == "quat":
+            target_tf = Transform3d(pos=ee_pos, rot=ee_rot_t, device=device, dtype=dtype)
+        elif rot_type == "matrix":
+            target_tf = Transform3d(pos=ee_pos, rot=ee_rot_t, device=device, dtype=dtype)
+        elif rot_type == "euler":
+            target_tf = Transform3d(pos=ee_pos, rot=ee_rot_t, device=device, dtype=dtype)
+        else:
+            raise ValueError(f"Unknown rot_type {rot_type}")
+
+    # Create differentiable IK solver
+    dik = DifferentiableIK(serial_chain, iters=iters, lr=lr, orientation_weight=orientation_weight,
+                           device=device, dtype=dtype)
+
+    # Solve for joint angles (differentiable)
+    if init_q is not None:
+        if not torch.is_tensor(init_q):
+            init_q = torch.tensor(init_q, dtype=dtype, device=device)
+        init_q = init_q.to(device=device, dtype=dtype)
+        if init_q.dim() == 1:
+            init_q = init_q.unsqueeze(0)
+        q_sol = dik.solve_unrolled(target_tf, init_q=init_q)
+    else:
+        q_sol = dik.solve_unrolled(target_tf)
+
+    # Compute joint/world positions for all serial frames
+    all_tfs = serial_chain.forward_kinematics(q_sol, end_only=False)
+    joints_world = []
+    for f in serial_chain._serial_frames:
+        tf_f = all_tfs[f.name]
+        mat = tf_f.get_matrix()
+        joints_world.append(mat[:, :3, 3])
+    joints_world = torch.stack(joints_world, dim=1)  # (N, K, 3)
+
+    # Transform positions into end-effector frame (end effector at origin)
+    ee_tf = all_tfs[serial_chain._serial_frames[-1].name]
+    ee_inv = ee_tf.inverse()
+    N = joints_world.shape[0]
+    K = joints_world.shape[1]
+    ones = torch.ones((N, K, 1), device=device, dtype=dtype)
+    joints_h = torch.cat([joints_world, ones], dim=-1)  # (N, K, 4)
+    ee_inv_mat = ee_inv.get_matrix()  # (N, 4, 4)
+    transformed = torch.matmul(joints_h, ee_inv_mat.transpose(-1, -2))  # (N, K, 4)
+    denom = transformed[..., 3:].clamp(min=1e-8)
+    joints_in_ee = transformed[..., :3] / denom
+    joints_in_ee = joints_in_ee[:, [0,2,4,5,6,8, 9]]
+    return joints_in_ee  #, q_sol
+
+
+def robosuite_ee_world_to_joint_positions(serial_chain: SerialChain,
+                                          ee_pos_world: torch.Tensor,
+                                          ee_rot_world: Optional[torch.Tensor] = None,
+                                          rot_type: str = "quat",
+                                          T_chain_base_in_world: Optional[torch.Tensor] = None,
+                                          iters: int = 50,
+                                          lr: float = 1e-2,
+                                          orientation_weight: float = 1.0,
+                                          init_q: Optional[torch.Tensor] = None,
+                                          device: Optional[str] = None,
+                                          dtype: Optional[torch.dtype] = None,
+                                          debug: bool = False):
+    """
+    Convert a robosuite end-effector pose (in world frame) to the chain frame,
+    run the differentiable IK, and convert resulting joint positions back to world frame.
+    
+    The function handles the conversion between Robosuite's world frame and the robot's base frame:
+    1. Transforms target pose from world frame to robot base frame
+    2. Solves IK in the robot base frame
+    3. Transforms resulting joint positions back to world frame
+    
+    Args:
+        serial_chain: SerialChain model for the robot
+        ee_pos_world: End-effector position in world frame (N,3)
+        ee_rot_world: Optional end-effector orientation in world frame
+        rot_type: Type of rotation representation ('quat','matrix','euler')
+        T_chain_base_in_world: Transform from world to robot base (4,4 or N,4,4)
+        iters: Number of optimization iterations
+        lr: Learning rate for optimization
+        orientation_weight: Weight for orientation error in optimization
+        init_q: Initial guess for joint angles
+        device: Computation device
+        dtype: Data type for computations
+
+    Returns:
+        joints_world: (N, K, 3) joint positions in world frame (meters)
+        q_sol: (N, DOF) joint angles in radians
+    """
+    if device is None:
+        device = serial_chain.device
+    if dtype is None:
+        dtype = serial_chain.dtype
+
+    # prepare tensors
+    if not torch.is_tensor(ee_pos_world):
+        ee_pos_world_t = torch.tensor(ee_pos_world, dtype=dtype, device=device)
+    else:
+        ee_pos_world_t = ee_pos_world.to(device=device, dtype=dtype)
+    if ee_pos_world_t.dim() == 1:
+        ee_pos_world_t = ee_pos_world_t.unsqueeze(0)
+
+    # prepare T_chain_base_in_world
+    # Handle robot base transform
+    if T_chain_base_in_world is None:
+        # If no transform provided, create transform considering robot's base position and orientation
+        # Assumes robot base is at world origin with identity rotation unless specified
+        T_world_chain = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(ee_pos_world_t.shape[0], 1, 1)
+    else:
+        # Allow passing either a 4x4 transform or a 3-vector position
+        if not torch.is_tensor(T_chain_base_in_world):
+            T_in = torch.tensor(T_chain_base_in_world, dtype=dtype, device=device)
+        else:
+            T_in = T_chain_base_in_world.to(device=device, dtype=dtype)
+            
+        # Handle the EE offset and rotation from the URDF/XML definition
+        # Note: This assumes the right_hand frame is the end effector
+
+        # If a translation vector is provided (3,) or (N,3), build a homogeneous transform with identity rotation
+        if T_in.dim() == 1 and T_in.numel() == 3:
+            # single translation
+            T_world_chain = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(ee_pos_world_t.shape[0], 1, 1)
+            T_world_chain[:, :3, 3] = T_in.unsqueeze(0)
+        elif T_in.dim() == 2 and T_in.shape[-1] == 3:
+            # batched translations (N,3)
+            T_world_chain = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(T_in.shape[0], 1, 1)
+            T_world_chain[:, :3, 3] = T_in
+            if T_world_chain.shape[0] == 1 and ee_pos_world_t.shape[0] > 1:
+                T_world_chain = T_world_chain.repeat(ee_pos_world_t.shape[0], 1, 1)
+        else:
+            # assume full homogeneous matrix or batched matrices
+            T_world_chain = T_in
+            if T_world_chain.dim() == 2:
+                T_world_chain = T_world_chain.unsqueeze(0)
+            if T_world_chain.shape[0] == 1 and ee_pos_world_t.shape[0] > 1:
+                T_world_chain = T_world_chain.repeat(ee_pos_world_t.shape[0], 1, 1)
+
+    # Convert from robosuite world frame to pytorch_kinematics base frame
+    # This includes both translation and coordinate frame alignment
+    ee_pos_chain = ee_pos_world_t.clone()
+    
+    # First, create the coordinate frame transformation matrix
+    # This handles the conversion between robosuite and pytorch_kinematics conventions
+    # Only Y axis needs to be flipped, X and Z remain the same
+    R_align = torch.eye(3, device=device, dtype=dtype)
+    R_align[1, 1] = -1  # Flip only Y axis to align frames
+    
+    if T_chain_base_in_world is not None:
+        if T_chain_base_in_world.dim() == 1:
+            # 1. Apply translation to robot base
+            base_pos = T_chain_base_in_world[:3]
+            if ee_pos_chain.dim() == 2:
+                base_pos = base_pos.unsqueeze(0)
+                R_align = R_align.unsqueeze(0)
+            
+            # 2. Translate to robot base origin
+            ee_pos_chain = ee_pos_world_t - base_pos
+            
+            # 3. Apply coordinate frame alignment
+            ee_pos_chain = torch.matmul(R_align, ee_pos_chain.unsqueeze(-1)).squeeze(-1)
+            
+        else:
+            # Full transform case including coordinate frame alignment
+            # Create a full 4x4 transformation that includes both translation and rotation
+            T_align = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(ee_pos_world_t.shape[0], 1, 1)
+            T_align[:, :3, :3] = R_align
+            
+            # Combine with base transform
+            T_full = torch.matmul(torch.linalg.inv(T_world_chain), T_align)
+            
+            # Apply transformation
+            ones = torch.ones((ee_pos_world_t.shape[0], 1), device=device, dtype=dtype)
+            ee_world_h = torch.cat([ee_pos_world_t, ones], dim=-1)  # (N,4)
+            ee_chain_h = torch.matmul(T_full, ee_world_h.unsqueeze(-1)).squeeze(-1)  # (N,4)
+            ee_pos_chain = ee_chain_h[:, :3]
+
+    # orientation: transform rotation into chain frame if provided
+    if ee_rot_world is None:
+        ee_rot_chain = None
+    else:
+        if not torch.is_tensor(ee_rot_world):
+            ee_rot_world_t = torch.tensor(ee_rot_world, dtype=dtype, device=device)
+        else:
+            ee_rot_world_t = ee_rot_world.to(device=device, dtype=dtype)
+        if ee_rot_world_t.dim() == 1:
+            ee_rot_world_t = ee_rot_world_t.unsqueeze(0)
+
+        if rot_type == "quat":
+            R_world = rotation_conversions.quaternion_to_matrix(ee_rot_world_t)
+        elif rot_type == "matrix":
+            R_world = ee_rot_world_t
+        elif rot_type == "euler":
+            R_world = rotation_conversions.euler_angles_to_matrix(ee_rot_world_t, "XYZ")
+        else:
+            raise ValueError(f"Unknown rot_type {rot_type}")
+
+        # Transform rotation according to base transform
+        if T_chain_base_in_world is not None:
+            if T_chain_base_in_world.dim() == 1:  # Just translation
+                ee_rot_chain = R_world  # No rotation transformation needed
+            else:  # Full transform
+                T_chain_world_inv = torch.linalg.inv(T_world_chain)
+                R_chain = torch.matmul(T_chain_world_inv[:, :3, :3], R_world)
+                if rot_type == "matrix":
+                    ee_rot_chain = R_chain
+                else:
+                    ee_rot_chain = rotation_conversions.matrix_to_quaternion(R_chain)
+        else:
+            if rot_type == "matrix":
+                ee_rot_chain = R_world
+            else:
+                ee_rot_chain = rotation_conversions.matrix_to_quaternion(R_world)
+
+    # solve IK in chain frame and get joint angles
+    # build Transform3d and call DifferentiableIK directly (similar to ee_pose_to_joint_positions)
+    target_tf_chain = Transform3d(pos=ee_pos_chain, rot=ee_rot_chain, device=device, dtype=dtype) if ee_rot_chain is not None else Transform3d(pos=ee_pos_chain, device=device, dtype=dtype)
+    dik = DifferentiableIK(serial_chain, iters=iters, lr=lr, orientation_weight=orientation_weight, device=device, dtype=dtype)
+    if init_q is not None:
+        if not torch.is_tensor(init_q):
+            init_q = torch.tensor(init_q, dtype=dtype, device=device)
+        if init_q.dim() == 1:
+            init_q = init_q.unsqueeze(0)
+        q_sol = dik.solve_unrolled(target_tf_chain, init_q=init_q)
+    else:
+        q_sol = dik.solve_unrolled(target_tf_chain)
+
+    # compute joint positions in world frame
+    all_tfs = serial_chain.forward_kinematics(q_sol, end_only=False)
+    joints_world_chain = []
+    for f in serial_chain._serial_frames:
+        tf_f = all_tfs[f.name]
+        mat = tf_f.get_matrix()
+        joints_world_chain.append(mat[:, :3, 3])
+    joints_world_chain = torch.stack(joints_world_chain, dim=1)  # (N, K, 3) in chain frame
+
+    # Convert joint positions from pytorch_kinematics frame back to robosuite world frame
+    N, K, _ = joints_world_chain.shape
+    
+    # Create coordinate frame alignment matrix (inverse of the previous one)
+    # For Y-axis flip only, the inverse is the same as the forward transform
+    R_align_inv = torch.eye(3, device=device, dtype=dtype)
+    R_align_inv[1, 1] = -1  # Flip Y axis back
+    
+    if T_chain_base_in_world is not None:
+        if T_chain_base_in_world.dim() == 1:
+            # 1. First undo coordinate frame alignment
+            if joints_world_chain.dim() == 3:
+                R_align_inv = R_align_inv.unsqueeze(0).unsqueeze(1)
+            joints_aligned = torch.matmul(R_align_inv, joints_world_chain.unsqueeze(-1)).squeeze(-1)
+            
+            # 2. Then translate back to world frame
+            base_pos = T_chain_base_in_world[:3]
+            if joints_world_chain.dim() == 3:
+                base_pos = base_pos.view(1, 1, 3)
+            joints_world = joints_aligned + base_pos
+        else:
+            # Full transform case
+            # Create full alignment transform
+            T_align_inv = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(N, 1, 1)
+            T_align_inv[:, :3, :3] = R_align_inv
+            
+            # Combine with world transform
+            T_full = torch.matmul(T_world_chain, T_align_inv)
+            
+            # Apply transformation
+            ones = torch.ones((N, K, 1), device=device, dtype=dtype)
+            joints_h = torch.cat([joints_world_chain, ones], dim=-1)  # (N,K,4)
+            
+            if T_full.shape[0] == 1 and N > 1:
+                T_full = T_full.repeat(N, 1, 1)
+            
+            # Transform points back to world frame
+            joints_h_reshaped = joints_h.view(N*K, 4).transpose(0, 1)
+            transformed = torch.matmul(T_full, joints_h_reshaped)
+            transformed = transformed.transpose(1, 2).view(N, K, 4)
+            
+            denom = transformed[..., 3:].clamp(min=1e-8)
+            joints_world = transformed[..., :3] / denom
+    else:
+        # Even without base transform, we still need to align coordinate frames
+        if joints_world_chain.dim() == 3:
+            R_align_inv = R_align_inv.unsqueeze(0).unsqueeze(1)
+        joints_world = torch.matmul(R_align_inv, joints_world_chain.unsqueeze(-1)).squeeze(-1)
+    
+    # Optional debug: compute end-effector pose from q_sol and compare to requested world pose
+    if debug:
+        try:
+            # forward kinematics (chain frame)
+            all_tfs_sol = serial_chain.forward_kinematics(q_sol, end_only=False)
+            ee_tf_sol = all_tfs_sol[serial_chain._serial_frames[-1].name]
+            ee_mat_chain = ee_tf_sol.get_matrix()  # (N,4,4) in chain frame
+            ee_pos_chain_sol = ee_mat_chain[:, :3, 3]
+
+            # Transform achieved position from pytorch_kinematics frame back to robosuite world frame
+            R_align_inv = torch.eye(3, device=device, dtype=dtype)
+            R_align_inv[1, 1] = -1  # Flip Y axis back (same as forward for Y-only flip)
+            
+            if T_chain_base_in_world is not None:
+                if T_chain_base_in_world.dim() == 1:
+                    # 1. First undo coordinate frame alignment
+                    if ee_pos_chain_sol.dim() == 2:
+                        R_align_inv = R_align_inv.unsqueeze(0)
+                    ee_pos_aligned = torch.matmul(R_align_inv, ee_pos_chain_sol.unsqueeze(-1)).squeeze(-1)
+                    
+                    # 2. Then translate back to world frame
+                    base_pos = T_chain_base_in_world[:3]
+                    if ee_pos_chain_sol.dim() == 2:
+                        base_pos = base_pos.unsqueeze(0)
+                    ee_world_pos_sol = ee_pos_aligned + base_pos
+                else:
+                    # Full transform case combining alignment and world transform
+                    T_align_inv = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(N, 1, 1)
+                    T_align_inv[:, :3, :3] = R_align_inv
+                    T_full = torch.matmul(T_world_chain, T_align_inv)
+                    
+                    ones_e = torch.ones((N, 1), device=device, dtype=dtype)
+                    ee_h_chain = torch.cat([ee_pos_chain_sol, ones_e], dim=-1)  # (N,4)
+                    ee_world_h = torch.matmul(T_full, ee_h_chain.unsqueeze(-1)).squeeze(-1)
+                    ee_world_pos_sol = ee_world_h[:, :3]
+            else:
+                # Even without base transform, we still need to align coordinate frames
+                if ee_pos_chain_sol.dim() == 2:
+                    R_align_inv = R_align_inv.unsqueeze(0)
+                ee_world_pos_sol = torch.matmul(R_align_inv, ee_pos_chain_sol.unsqueeze(-1)).squeeze(-1)
+
+            # original target in world frame (ensure same device/dtype)
+            tgt_world = ee_pos_world_t.to(device=device, dtype=dtype)
+            if tgt_world.dim() == 1:
+                tgt_world = tgt_world.unsqueeze(0)
+
+            pos_err = (ee_world_pos_sol - tgt_world).norm(dim=1)
+            print('\n[robosuite_ee_world_to_joint_positions debug]')
+            print('T_world_chain =')
+            print(T_world_chain)
+            print('target ee world pos =', tgt_world)
+            print('achieved ee world pos =', ee_world_pos_sol)
+            print('ee position error (L2) =', pos_err)
+        except Exception as e:
+            print('Debug forward-kinematics check failed:', e)
+
+    return joints_world, q_sol
+
+
+def robosuite_ee_world_to_joint_positions_safe(serial_chain: SerialChain,
+                                                ee_pos_world: torch.Tensor,
+                                                ee_rot_world: Optional[torch.Tensor] = None,
+                                                rot_type: str = "quat",
+                                                T_chain_base_in_world: Optional[torch.Tensor] = None,
+                                                max_reach: float = 0.5,
+                                                project_if_unreachable: bool = True,
+                                                warn_if_unreachable: bool = True,
+                                                iters: int = 50,
+                                                lr: float = 1e-2,
+                                                orientation_weight: float = 1.0,
+                                                init_q: Optional[torch.Tensor] = None,
+                                                device: Optional[str] = None,
+                                                dtype: Optional[torch.dtype] = None,
+                                                debug: bool = False):
+    """
+    Safety wrapper around `robosuite_ee_world_to_joint_positions`.
+
+    - Computes horizontal distance (XY) from robot base to the requested world target(s).
+    - If any target lies outside `max_reach`, optionally project it onto the reachable disk
+      (in the XY plane) and optionally warn.
+    - Calls the original IK function with (possibly) projected targets and returns
+      (joints_world, q_sol, info) where info contains metadata about projection.
+
+    Returns:
+        joints_world: (N, K, 3)
+        q_sol: (N, DOF)
+        info: dict with keys:
+            - 'was_projected': Tensor(bool) shape (N,)
+            - 'orig_targets': Tensor (N,3)
+            - 'proj_targets': Tensor (N,3)
+            - 'horiz_dist': Tensor (N,)
+    """
+    if device is None:
+        device = serial_chain.device
+    if dtype is None:
+        dtype = serial_chain.dtype
+
+    # ensure tensor form and batch
+    if not torch.is_tensor(ee_pos_world):
+        ee_pos_world_t = torch.tensor(ee_pos_world, dtype=dtype, device=device)
+    else:
+        ee_pos_world_t = ee_pos_world.to(device=device, dtype=dtype)
+    if ee_pos_world_t.dim() == 1:
+        ee_pos_world_t = ee_pos_world_t.unsqueeze(0)
+
+    # build T_world_chain same as main function
+    if T_chain_base_in_world is None:
+        T_world_chain = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(ee_pos_world_t.shape[0], 1, 1)
+    else:
+        if not torch.is_tensor(T_chain_base_in_world):
+            T_in = torch.tensor(T_chain_base_in_world, dtype=dtype, device=device)
+        else:
+            T_in = T_chain_base_in_world.to(device=device, dtype=dtype)
+        if T_in.dim() == 1 and T_in.numel() == 3:
+            T_world_chain = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(ee_pos_world_t.shape[0], 1, 1)
+            T_world_chain[:, :3, 3] = T_in.unsqueeze(0)
+        elif T_in.dim() == 2 and T_in.shape[-1] == 3:
+            T_world_chain = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(T_in.shape[0], 1, 1)
+            T_world_chain[:, :3, 3] = T_in
+            if T_world_chain.shape[0] == 1 and ee_pos_world_t.shape[0] > 1:
+                T_world_chain = T_world_chain.repeat(ee_pos_world_t.shape[0], 1, 1)
+        else:
+            T_world_chain = T_in
+            if T_world_chain.dim() == 2:
+                T_world_chain = T_world_chain.unsqueeze(0)
+            if T_world_chain.shape[0] == 1 and ee_pos_world_t.shape[0] > 1:
+                T_world_chain = T_world_chain.repeat(ee_pos_world_t.shape[0], 1, 1)
+
+    # base positions (N,3)
+    base_pos = T_world_chain[:, :3, 3]
+
+    # compute horizontal distances
+    diff_xy = ee_pos_world_t[:, :2] - base_pos[:, :2]
+    horiz_dist = torch.linalg.norm(diff_xy, dim=1)
+
+    was_projected = torch.zeros(horiz_dist.shape, dtype=torch.bool, device=device)
+    proj_targets = ee_pos_world_t.clone()
+
+    if (horiz_dist > max_reach).any():
+        mask = horiz_dist > max_reach
+        was_projected = mask.clone()
+        if warn_if_unreachable:
+            print(f"[robosuite_ee_world_to_joint_positions_safe] Warning: {mask.sum().item()} target(s) outside max_reach={max_reach:.3f} m; will {'project' if project_if_unreachable else 'not project'}.")
+        if project_if_unreachable:
+            # project each masked target onto circle of radius max_reach centered at base
+            vx = diff_xy[mask, 0]
+            vy = diff_xy[mask, 1]
+            r = torch.linalg.norm(torch.stack([vx, vy], dim=1), dim=1)
+            # avoid divide by zero
+            r_clamped = r.clone()
+            r_clamped[r_clamped == 0] = 1.0
+            scale = (max_reach / r_clamped).unsqueeze(1)
+            new_xy = torch.stack([vx, vy], dim=1) * scale
+            proj_targets[mask, 0] = base_pos[mask, 0] + new_xy[:, 0]
+            proj_targets[mask, 1] = base_pos[mask, 1] + new_xy[:, 1]
+            # keep original z
+
+    # Call underlying IK with projected targets (or original if none projected)
+    joints_world, q_sol = robosuite_ee_world_to_joint_positions(
+        serial_chain=serial_chain,
+        ee_pos_world=proj_targets,
+        ee_rot_world=ee_rot_world,
+        rot_type=rot_type,
+        T_chain_base_in_world=T_world_chain,
+        iters=iters,
+        lr=lr,
+        orientation_weight=orientation_weight,
+        init_q=init_q,
+        device=device,
+        dtype=dtype,
+        debug=debug,
+    )
+
+    info = {
+        'was_projected': was_projected,
+        'orig_targets': ee_pos_world_t,
+        'proj_targets': proj_targets,
+        'horiz_dist': horiz_dist,
+    }
+
+    return joints_world, q_sol, info
 
 
 class PseudoInverseIKWithSVD(PseudoInverseIK):
